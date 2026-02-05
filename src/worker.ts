@@ -9,6 +9,10 @@ import { isPluginDomain } from './utils/is-plugin-domain'
 import { buildDenoUrl } from './utils/build-deno-url'
 import { buildPluginUrl } from './utils/build-plugin-url'
 
+// Sitemap imports
+import { getKnownServices, getKnownPlugins, coalesceDiscovery, coalescePluginDiscovery } from './utils/app-registry'
+import { get, set } from './utils/cache'
+
 export interface Env {
   // Optional env vars to control logging without code changes
   LOG_ROUTE_SAMPLE?: string // 0..1 sampling for normal route logs (deno/plugin)
@@ -46,6 +50,32 @@ function shouldLog(kind: LogKind, request: Request, url: URL, env: Env): boolean
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
+
+    // Sitemap endpoints
+    if (url.pathname === '/sitemap.xml') {
+      return handleSitemapApps()
+    }
+    if (url.pathname === '/sitemap-apps.xml') {
+      return handleSitemapApps()
+    }
+    if (url.pathname === '/sitemap-plugins.xml') {
+      return handleSitemapPlugins()
+    }
+    if (url.pathname === '/map.json') {
+      return handleMapApps()
+    }
+    if (url.pathname === '/map-apps.json') {
+      return handleMapApps()
+    }
+    if (url.pathname === '/map-plugins.json') {
+      return handleMapPlugins()
+    }
+    if (url.pathname === '/sitemap.json') {
+      return handleSitemapApps()
+    }
+    if (url.pathname === '/plugin-map.xml') {
+      return handleSitemapPlugins()
+    }
 
     if (url.pathname === '/__health') {
       if (shouldLog('health', request, url, env)) {
@@ -229,4 +259,173 @@ function shortHash(input: string): string {
     h = (h * 31 + ch.charCodeAt(0)) >>> 0
   }
   return h.toString(16).padStart(4, '0').slice(0, 4)
+}
+
+// ===== Sitemap/Map Handlers =====
+
+interface SitemapEntry {
+  url: string
+  subdomain?: string
+  pluginName?: string
+  serviceType: string
+  priority: number
+  changefreq: string
+  lastmod: string
+  github: string
+  denoUrl?: string
+  deployments?: {
+    main: { url: string; available: boolean }
+    development: { url: string; available: boolean }
+  }
+}
+
+// Sitemap handler for apps
+async function handleSitemapApps(): Promise<Response> {
+  const entries = await discoverServicesForSitemap()
+  const xml = generateXmlSitemapSimple(entries)
+  return new Response(xml, {
+    headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+  })
+}
+
+// Map handler for apps
+async function handleMapApps(): Promise<Response> {
+  const entries = await discoverServicesForSitemap()
+  const json = {
+    version: '1.0',
+    generated: new Date().toISOString(),
+    generator: 'ubq.fi-router',
+    totalUrls: entries.length,
+    apps: entries,
+  }
+  return new Response(JSON.stringify(json, null, 2), {
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+  })
+}
+
+// Sitemap handler for plugins
+async function handleSitemapPlugins(): Promise<Response> {
+  const entries = await discoverPluginsForSitemap()
+  const xml = generateXmlPluginMapSimple(entries)
+  return new Response(xml, {
+    headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+  })
+}
+
+// Map handler for plugins
+async function handleMapPlugins(): Promise<Response> {
+  const entries = await discoverPluginsForSitemap()
+  const json = {
+    version: '1.0',
+    generated: new Date().toISOString(),
+    generator: 'ubq.fi-router',
+    totalPlugins: entries.length,
+    plugins: entries,
+  }
+  return new Response(JSON.stringify(json, null, 2), {
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+  })
+}
+
+// Discover services for sitemap
+async function discoverServicesForSitemap(): Promise<SitemapEntry[]> {
+  const services = getKnownServices()
+  const entries: SitemapEntry[] = []
+
+  for (const config of services) {
+    let serviceType = 'service-none'
+    const cacheKey = `service-type:${config.subdomain}`
+    const cachedType = get<string>(cacheKey)
+
+    if (cachedType !== null) {
+      serviceType = cachedType
+    } else {
+      const result = await coalesceDiscovery(config.subdomain)
+      serviceType = result.startsWith('service-') ? result : 'service-none'
+      set(cacheKey, serviceType, 3600000)
+    }
+
+    const domain = config.subdomain === '' ? 'ubq.fi' : `${config.subdomain}.ubq.fi`
+    entries.push({
+      url: `https://${domain}/`,
+      subdomain: config.subdomain,
+      serviceType,
+      priority: config.subdomain === '' ? 1.0 : 0.8,
+      changefreq: serviceType === 'service-none' ? 'monthly' : 'weekly',
+      lastmod: new Date().toISOString(),
+      github: `https://github.com/${config.github}`,
+      denoUrl: `https://${config.subdomain === '' ? 'ubq-fi' : config.subdomain + '-ubq-fi'}.deno.dev`,
+    })
+  }
+  return entries
+}
+
+// Discover plugins for sitemap
+async function discoverPluginsForSitemap(): Promise<SitemapEntry[]> {
+  const plugins = getKnownPlugins()
+  const entries: SitemapEntry[] = []
+
+  for (const config of plugins) {
+    let serviceType = 'plugin-none'
+    const cacheKey = `plugin-type:${config.name}`
+    const cachedType = get<string>(cacheKey)
+
+    if (cachedType !== null) {
+      serviceType = cachedType
+    } else {
+      const result = await coalescePluginDiscovery(config.name)
+      serviceType = result.startsWith('plugin-') ? result : 'plugin-none'
+      set(cacheKey, serviceType, 3600000)
+    }
+
+    entries.push({
+      url: `https://os-${config.name}.ubq.fi/`,
+      pluginName: config.name,
+      serviceType,
+      priority: 0.7,
+      changefreq: serviceType === 'plugin-none' ? 'monthly' : 'weekly',
+      lastmod: new Date().toISOString(),
+      github: `https://github.com/${config.github}`,
+      deployments: {
+        main: {
+          url: `https://${config.name}-main.deno.dev`,
+          available: serviceType !== 'plugin-none',
+        },
+        development: {
+          url: `https://${config.name}-development.deno.dev`,
+          available: false,
+        },
+      },
+    })
+  }
+  return entries
+}
+
+// Generate XML sitemap (simple inline version)
+function generateXmlSitemapSimple(entries: SitemapEntry[]): string {
+  const urls = entries.map(e => `  <url>
+    <loc>${e.url}</loc>
+    <lastmod>${e.lastmod}</lastmod>
+    <changefreq>${e.changefreq}</changefreq>
+    <priority>${e.priority.toFixed(1)}</priority>
+  </url>`).join('\n')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls}
+</urlset>`
+}
+
+// Generate XML plugin map (simple inline version)
+function generateXmlPluginMapSimple(entries: SitemapEntry[]): string {
+  const urls = entries.map(e => `  <url>
+    <loc>${e.url}</loc>
+    <lastmod>${e.lastmod}</lastmod>
+    <changefreq>${e.changefreq}</changefreq>
+    <priority>${e.priority.toFixed(1)}</priority>
+    <!-- Plugin: ${e.pluginName} -->
+  </url>`).join('\n')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls}
+</urlset>`
 }
