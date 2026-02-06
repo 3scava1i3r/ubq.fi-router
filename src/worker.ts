@@ -12,12 +12,18 @@ import { buildPluginUrl } from './utils/build-plugin-url'
 // Sitemap imports
 import { getKnownServices, getKnownPlugins, coalesceDiscovery, coalescePluginDiscovery } from './utils/app-registry'
 import { get, set } from './utils/cache'
+import { getKnownServices as getKnownServicesDynamic, getKnownPlugins as getKnownPluginsDynamic } from './utils/github-integration'
+import { discoverAllServices, discoverAllPlugins } from './core/discovery'
 
 export interface Env {
   // Optional env vars to control logging without code changes
   LOG_ROUTE_SAMPLE?: string // 0..1 sampling for normal route logs (deno/plugin)
   LOG_RPC_SAMPLE?: string   // 0..1 sampling for RPC logs
   LOG_HEALTH_SAMPLE?: string // 0..1 sampling for health logs
+
+  // Required env vars for dynamic discovery
+  GITHUB_TOKEN?: string
+  KV_NAMESPACE?: string
 }
 
 type LogKind = 'route' | 'rpc' | 'health'
@@ -51,31 +57,19 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
 
-    // Sitemap endpoints
-    if (url.pathname === '/sitemap.xml') {
-      return handleSitemapApps()
-    }
-    if (url.pathname === '/sitemap-apps.xml') {
-      return handleSitemapApps()
-    }
-    if (url.pathname === '/sitemap-plugins.xml') {
-      return handleSitemapPlugins()
-    }
-    if (url.pathname === '/map.json') {
-      return handleMapApps()
-    }
-    if (url.pathname === '/map-apps.json') {
-      return handleMapApps()
-    }
-    if (url.pathname === '/map-plugins.json') {
-      return handleMapPlugins()
-    }
-    if (url.pathname === '/sitemap.json') {
-      return handleSitemapApps()
-    }
-    if (url.pathname === '/plugin-map.xml') {
-      return handleSitemapPlugins()
-    }
+// Sitemap endpoints
+if (url.pathname === '/sitemap.xml') {
+  return handleSitemapApps(env)
+}
+if (url.pathname === '/sitemap.json') {
+  return handleMapApps(env)
+}
+if (url.pathname === '/plugin-map.json') {
+  return handleMapPlugins(env)
+}
+if (url.pathname === '/plugin-map.xml') {
+  return handleSitemapPlugins(env)
+}
 
     if (url.pathname === '/__health') {
       if (shouldLog('health', request, url, env)) {
@@ -277,11 +271,15 @@ interface SitemapEntry {
     main: { url: string; available: boolean }
     development: { url: string; available: boolean }
   }
+  commands?: Record<string, any>
+  listeners?: string[]
+  configuration?: Record<string, any>
+  homepage_url?: string
 }
 
 // Sitemap handler for apps
-async function handleSitemapApps(): Promise<Response> {
-  const entries = await discoverServicesForSitemap()
+async function handleSitemapApps(env: Env): Promise<Response> {
+  const entries = await discoverServicesForSitemap(env)
   const xml = generateXmlSitemapSimple(entries)
   return new Response(xml, {
     headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
@@ -289,8 +287,8 @@ async function handleSitemapApps(): Promise<Response> {
 }
 
 // Map handler for apps
-async function handleMapApps(): Promise<Response> {
-  const entries = await discoverServicesForSitemap()
+async function handleMapApps(env: Env): Promise<Response> {
+  const entries = await discoverServicesForSitemap(env)
   const json = {
     version: '1.0',
     generated: new Date().toISOString(),
@@ -304,8 +302,8 @@ async function handleMapApps(): Promise<Response> {
 }
 
 // Sitemap handler for plugins
-async function handleSitemapPlugins(): Promise<Response> {
-  const entries = await discoverPluginsForSitemap()
+async function handleSitemapPlugins(env: Env): Promise<Response> {
+  const entries = await discoverPluginsForSitemap(env)
   const xml = generateXmlPluginMapSimple(entries)
   return new Response(xml, {
     headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
@@ -313,8 +311,8 @@ async function handleSitemapPlugins(): Promise<Response> {
 }
 
 // Map handler for plugins
-async function handleMapPlugins(): Promise<Response> {
-  const entries = await discoverPluginsForSitemap()
+async function handleMapPlugins(env: Env): Promise<Response> {
+  const entries = await discoverPluginsForSitemap(env)
   const json = {
     version: '1.0',
     generated: new Date().toISOString(),
@@ -328,102 +326,203 @@ async function handleMapPlugins(): Promise<Response> {
 }
 
 // Discover services for sitemap
-async function discoverServicesForSitemap(): Promise<SitemapEntry[]> {
-  const services = getKnownServices()
-  const entries: SitemapEntry[] = []
+async function discoverServicesForSitemap(env: Env): Promise<SitemapEntry[]> {
+  const githubToken = env.GITHUB_TOKEN ?? ''
+  const kvNamespace = env.KV_NAMESPACE ?? ''
 
-  for (const config of services) {
-    let serviceType = 'service-none'
-    const cacheKey = `service-type:${config.subdomain}`
-    const cachedType = get<string>(cacheKey)
+  // Skip dynamic discovery if no token
+  if (!env.GITHUB_TOKEN) {
+    return getFallbackServices()
+  }
 
-    if (cachedType !== null) {
-      serviceType = cachedType
-    } else {
-      const result = await coalesceDiscovery(config.subdomain)
-      serviceType = result.startsWith('service-') ? result : 'service-none'
-      set(cacheKey, serviceType, 3600000)
+  try {
+    // Try dynamic discovery first
+    const serviceMap = await discoverAllServices(kvNamespace, githubToken)
+    const entries: SitemapEntry[] = []
+
+    for (const [subdomain, serviceType] of serviceMap) {
+      const githubRepo = subdomain ? `ubiquity/${subdomain}.ubq.fi` : 'ubiquity/ubq.fi'
+      const domain = subdomain === '' ? 'ubq.fi' : `${subdomain}.ubq.fi`
+      entries.push({
+        url: `https://${domain}/`,
+        subdomain: subdomain,
+        serviceType: serviceType,
+        priority: subdomain === '' ? 1.0 : 0.8,
+        changefreq: serviceType === 'service-none' ? 'monthly' : 'weekly',
+        lastmod: new Date().toISOString(),
+        github: `https://github.com/${githubRepo}`,
+        denoUrl: `https://${subdomain === '' ? 'ubq-fi' : subdomain + '-ubq-fi'}.deno.dev`,
+      })
     }
 
-    const domain = config.subdomain === '' ? 'ubq.fi' : `${config.subdomain}.ubq.fi`
-    entries.push({
-      url: `https://${domain}/`,
-      subdomain: config.subdomain,
-      serviceType,
-      priority: config.subdomain === '' ? 1.0 : 0.8,
-      changefreq: serviceType === 'service-none' ? 'monthly' : 'weekly',
-      lastmod: new Date().toISOString(),
-      github: `https://github.com/${config.github}`,
-      denoUrl: `https://${config.subdomain === '' ? 'ubq-fi' : config.subdomain + '-ubq-fi'}.deno.dev`,
-    })
+    return entries
+  } catch (error) {
+    console.warn('Dynamic service discovery failed, falling back to hardcoded services:', error)
+    return getFallbackServices()
   }
-  return entries
+}
+
+function getFallbackServices(): SitemapEntry[] {
+  const services = [
+    '', 'work', 'pay', 'ai', 'demo', 'xp', 'uusd', 'stake', 'safe', 'card',
+    'permit2-allowance', 'partner', 'onboard', 'notifications', 'leaderboard', 'keygen', 'health', 'audit', 'testfallback'
+  ]
+  
+  return services.map(subdomain => ({
+    url: `https://${subdomain || 'ubq.fi'}/`,
+    subdomain,
+    serviceType: 'service-none',
+    priority: subdomain === '' ? 1.0 : 0.8,
+    changefreq: 'monthly' as const,
+    lastmod: new Date().toISOString(),
+    github: `https://github.com/ubiquity/${subdomain || 'ubq.fi'}`,
+    denoUrl: `https://${subdomain === '' ? 'ubq-fi' : subdomain + '-ubq-fi'}.deno.dev`,
+  }))
 }
 
 // Discover plugins for sitemap
-async function discoverPluginsForSitemap(): Promise<SitemapEntry[]> {
-  const plugins = getKnownPlugins()
-  const entries: SitemapEntry[] = []
+async function discoverPluginsForSitemap(env: Env): Promise<SitemapEntry[]> {
+  const githubToken = env.GITHUB_TOKEN ?? ''
+  const kvNamespace = env.KV_NAMESPACE ?? ''
 
-  for (const config of plugins) {
-    let serviceType = 'plugin-none'
-    const cacheKey = `plugin-type:${config.name}`
-    const cachedType = get<string>(cacheKey)
+  // Skip dynamic discovery if no token
+  if (!env.GITHUB_TOKEN) {
+    return getFallbackPlugins()
+  }
 
-    if (cachedType !== null) {
-      serviceType = cachedType
-    } else {
-      const result = await coalescePluginDiscovery(config.name)
-      serviceType = result.startsWith('plugin-') ? result : 'plugin-none'
-      set(cacheKey, serviceType, 3600000)
+  try {
+    // Try dynamic discovery first
+    const pluginMap = await discoverAllPlugins(kvNamespace, githubToken)
+    const entries: SitemapEntry[] = []
+
+    for (const [pluginName, { serviceType, manifest }] of pluginMap) {
+      const subdomain = `os-${pluginName}`
+      const githubRepo = `ubiquity-os-marketplace/${pluginName}`
+
+      // Extract rich metadata from manifest
+      const richMetadata: any = {}
+      if (manifest) {
+        if (manifest.commands) richMetadata.commands = manifest.commands
+        if (manifest["ubiquity:listeners"]) richMetadata.listeners = manifest["ubiquity:listeners"]
+        if (manifest.configuration) richMetadata.configuration = manifest.configuration
+        if (manifest.homepage_url) richMetadata.homepage_url = manifest.homepage_url
+      }
+
+      entries.push({
+        url: `https://os-${pluginName}.ubq.fi/`,
+        pluginName: pluginName,
+        serviceType: serviceType,
+        priority: 0.7,
+        changefreq: serviceType === 'plugin-none' ? 'monthly' : 'weekly',
+        lastmod: new Date().toISOString(),
+        github: `https://github.com/${githubRepo}`,
+        deployments: {
+          main: {
+            url: `https://${pluginName}-main.deno.dev`,
+            available: serviceType !== 'plugin-none',
+          },
+          development: {
+            url: `https://${pluginName}-development.deno.dev`,
+            available: false,
+          },
+        },
+        ...richMetadata,
+      })
     }
 
-    entries.push({
-      url: `https://os-${config.name}.ubq.fi/`,
-      pluginName: config.name,
-      serviceType,
-      priority: 0.7,
-      changefreq: serviceType === 'plugin-none' ? 'monthly' : 'weekly',
-      lastmod: new Date().toISOString(),
-      github: `https://github.com/${config.github}`,
-      deployments: {
-        main: {
-          url: `https://${config.name}-main.deno.dev`,
-          available: serviceType !== 'plugin-none',
-        },
-        development: {
-          url: `https://${config.name}-development.deno.dev`,
-          available: false,
-        },
-      },
-    })
+    return entries
+  } catch (error) {
+    console.warn('Dynamic plugin discovery failed, falling back to hardcoded plugins:', error)
+    return getFallbackPlugins()
   }
-  return entries
 }
 
-// Generate XML sitemap (simple inline version)
+function getFallbackPlugins(): SitemapEntry[] {
+  const plugins = [
+    'testfallback','daemon-xp', 'daemon-xp-main', 'daemon-xp-development',
+    'text-conversation-rewards', 'text-conversation-rewards-main', 'text-conversation-rewards-development',
+    'daemon-task-matcher', 'daemon-task-matcher-main', 'daemon-task-matcher-development',
+    'daemon-spec-rewriter', 'daemon-spec-rewriter-main', 'daemon-spec-rewriter-development',
+    'text-vector-embeddings', 'text-vector-embeddings-main', 'text-vector-embeddings-development',
+    'daemon-pricing', 'daemon-pricing-main', 'daemon-pricing-development',
+    'command-config', 'command-config-main', 'command-config-development',
+    'daemon-planner', 'daemon-planner-main', 'daemon-planner-development',
+    'daemon-merging', 'daemon-merging-main', 'daemon-merging-development',
+    'command-wallet', 'command-wallet-main', 'command-wallet-development',
+    'daemon-disqualifier', 'daemon-disqualifier-main', 'daemon-disqualifier-development',
+    'command-start-stop', 'command-start-stop-main', 'command-start-stop-development',
+    'command-query', 'command-query-main', 'command-query-development', 
+  ]
+  
+  return plugins.map(name => ({
+    url: `https://os-${name}.ubq.fi/`,
+    pluginName: name,
+    serviceType: 'plugin-none',
+    priority: 0.7,
+    changefreq: 'monthly' as const,
+    lastmod: new Date().toISOString(),
+    github: `https://github.com/ubiquity-os-marketplace/${name}`,
+    deployments: {
+      main: {
+        url: `https://${name}-main.deno.dev`,
+        available: false,
+      },
+      development: {
+        url: `https://${name}-development.deno.dev`,
+        available: false,
+      },
+    },
+  }))
+}
+
+// Generate XML sitemap (enhanced with rich metadata)
 function generateXmlSitemapSimple(entries: SitemapEntry[]): string {
-  const urls = entries.map(e => `  <url>
+  const urls = entries.map(e => {
+    let metadata = ''
+    if (e.pluginName) {
+      metadata = `<!-- Plugin: ${e.pluginName} -->`
+    }
+    return `  <url>
     <loc>${e.url}</loc>
     <lastmod>${e.lastmod}</lastmod>
     <changefreq>${e.changefreq}</changefreq>
     <priority>${e.priority.toFixed(1)}</priority>
-  </url>`).join('\n')
+    ${metadata}
+  </url>`
+  }).join('\n')
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${urls}
 </urlset>`
 }
 
-// Generate XML plugin map (simple inline version)
+// Generate XML plugin map (enhanced with rich metadata)
 function generateXmlPluginMapSimple(entries: SitemapEntry[]): string {
-  const urls = entries.map(e => `  <url>
+  const urls = entries.map(e => {
+    let metadata = ''
+    if (e.pluginName) {
+      metadata = `<!-- Plugin: ${e.pluginName} -->`
+    }
+    if (e.commands) {
+      metadata += `\n    <!-- Commands: ${Object.keys(e.commands).join(', ')} -->`
+    }
+    if (e.listeners) {
+      metadata += `\n    <!-- Listeners: ${e.listeners.join(', ')} -->`
+    }
+    if (e.configuration) {
+      metadata += `\n    <!-- Configuration: ${Object.keys(e.configuration).join(', ')} -->`
+    }
+    if (e.homepage_url) {
+      metadata += `\n    <!-- Homepage: ${e.homepage_url} -->`
+    }
+    return `  <url>
     <loc>${e.url}</loc>
     <lastmod>${e.lastmod}</lastmod>
     <changefreq>${e.changefreq}</changefreq>
     <priority>${e.priority.toFixed(1)}</priority>
-    <!-- Plugin: ${e.pluginName} -->
-  </url>`).join('\n')
+    ${metadata}
+  </url>`
+  }).join('\n')
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${urls}
